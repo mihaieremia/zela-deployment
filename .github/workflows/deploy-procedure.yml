@@ -83,11 +83,12 @@ jobs:
             exit 1
           fi
           # Sanity-check the magic bytes: WASM modules and Component Model
-          # components both begin with \0asm.
-          head -c 4 "$path" | od -An -c | grep -q 'asm' || {
-            echo "::error::$path is not a valid wasm file."
+          # components both begin with the four bytes 00 61 73 6D ("\0asm").
+          magic=$(head -c 4 "$path" | xxd -p)
+          if [ "$magic" != "0061736d" ]; then
+            echo "::error::$path is not a valid wasm file (magic = $magic, expected 0061736d)."
             exit 1
-          }
+          fi
           size=$(stat -c%s "$path")
           echo "Verified $path ($size bytes)."
 
