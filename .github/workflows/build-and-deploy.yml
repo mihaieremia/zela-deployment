@@ -61,8 +61,12 @@ on:
         required: true
 
 jobs:
+  # Inner `uses:` references must be absolute (`org/repo/...@ref`) so this
+  # composer also works when called from another repo. Relative paths
+  # (`./.github/workflows/...`) only resolve against the calling repo, which
+  # silently breaks cross-repo invocations.
   build:
-    uses: ./.github/workflows/build-procedure.yml
+    uses: mihaieremia/zela-deployment/.github/workflows/build-procedure.yml@v1
     with:
       procedure: ${{ inputs.procedure }}
       cargo-package: ${{ inputs.cargo-package }}
@@ -73,7 +77,7 @@ jobs:
 
   deploy:
     needs: build
-    uses: ./.github/workflows/deploy-procedure.yml
+    uses: mihaieremia/zela-deployment/.github/workflows/deploy-procedure.yml@v1
     with:
       procedure: ${{ inputs.procedure }}
       project: ${{ inputs.project }}
