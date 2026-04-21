@@ -1,0 +1,143 @@
+name: Deploy Procedure
+
+# Reusable workflow: uploads a pre-built `.wasm` to Zela's builder API.
+# Pair with `build-procedure.yml` (or build the wasm yourself and pass the
+# artifact name).
+#
+# Security note: every input that flows into a `run:` block is forwarded via
+# `env:` rather than expanded inline, to neutralise command-injection if a
+# caller forwards untrusted data into one of these inputs.
+
+on:
+  workflow_call:
+    inputs:
+      procedure:
+        description: "Procedure name (must match the destination on the dashboard)."
+        required: true
+        type: string
+      project:
+        description: "Zela project ID (UUID from the dashboard)."
+        required: true
+        type: string
+      wasm-artifact:
+        description: "Name of the artifact (uploaded by a previous job) containing the .wasm."
+        required: true
+        type: string
+      wasm-file-name:
+        description: "Filename inside the artifact. Defaults to `${procedure}.wasm`."
+        required: false
+        type: string
+        default: ""
+      core-url:
+        description: "Zela builder API base URL."
+        required: false
+        type: string
+        default: "https://core.zela.io"
+      auth-url:
+        description: "Zela OIDC token endpoint."
+        required: false
+        type: string
+        default: "https://auth.zela.io/realms/zela/protocol/openid-connect/token"
+      runs-on:
+        description: "GitHub-hosted runner image."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      key-id:
+        description: "Zela project key ID."
+        required: true
+      key-secret:
+        description: "Zela project key secret."
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.procedure }}
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Resolve filename
+        id: config
+        env:
+          INPUT_PROCEDURE: ${{ inputs.procedure }}
+          INPUT_WASM_FILE_NAME: ${{ inputs.wasm-file-name }}
+        run: |
+          name="${INPUT_WASM_FILE_NAME:-${INPUT_PROCEDURE}.wasm}"
+          echo "wasm-file-name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Download wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.wasm-artifact }}
+          path: ./artifact
+
+      - name: Verify artifact
+        env:
+          WASM_FILE_NAME: ${{ steps.config.outputs.wasm-file-name }}
+          ARTIFACT_NAME: ${{ inputs.wasm-artifact }}
+        run: |
+          path="./artifact/${WASM_FILE_NAME}"
+          if [ ! -f "$path" ]; then
+            echo "::error::Expected $path inside artifact '${ARTIFACT_NAME}', but it was not found."
+            echo "Artifact contents:" ; ls -la ./artifact
+            exit 1
+          fi
+          # Sanity-check the magic bytes: WASM modules and Component Model
+          # components both begin with \0asm.
+          head -c 4 "$path" | od -An -c | grep -q 'asm' || {
+            echo "::error::$path is not a valid wasm file."
+            exit 1
+          }
+          size=$(stat -c%s "$path")
+          echo "Verified $path ($size bytes)."
+
+      - name: Acquire OAuth token
+        id: token
+        env:
+          ZELA_KEY_ID: ${{ secrets.key-id }}
+          ZELA_KEY_SECRET: ${{ secrets.key-secret }}
+          AUTH_URL: ${{ inputs.auth-url }}
+        run: |
+          response=$(curl -sS --user "$ZELA_KEY_ID:$ZELA_KEY_SECRET" \
+            --data-urlencode 'grant_type=client_credentials' \
+            --data-urlencode 'scope=zela-builder:read zela-builder:write' \
+            "$AUTH_URL")
+          token=$(echo "$response" | jq -r '.access_token // empty')
+          if [ -z "$token" ]; then
+            echo "::error::OAuth token request failed."
+            # Echo response with sensitive fields stripped just in case.
+            echo "$response" | jq 'del(.access_token, .refresh_token)' || echo "$response"
+            exit 1
+          fi
+          # Mask the token so accidental echoes are scrubbed from logs.
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wasm to Zela
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+          CORE_URL: ${{ inputs.core-url }}
+          INPUT_PROCEDURE: ${{ inputs.procedure }}
+          INPUT_PROJECT: ${{ inputs.project }}
+          WASM_FILE_NAME: ${{ steps.config.outputs.wasm-file-name }}
+        run: |
+          path="./artifact/${WASM_FILE_NAME}"
+          url="${CORE_URL}/procedures/${INPUT_PROCEDURE}/wasm?project=${INPUT_PROJECT}&file_name=${WASM_FILE_NAME}"
+
+          # Capture body + status separately so we can surface the API's error
+          # message on failure (the original workflow's `-f` swallowed bodies).
+          http_code=$(curl --progress-bar -o /tmp/zela-response.txt -w '%{http_code}' \
+            -H "authorization: Bearer $TOKEN" \
+            -H 'content-type: application/wasm' \
+            --data-binary "@$path" \
+            "$url")
+
+          echo "HTTP $http_code"
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::Deploy failed with HTTP $http_code."
+            echo "Response body:"
+            cat /tmp/zela-response.txt
+            exit 1
+          fi
+          echo "Deploy succeeded."
+          cat /tmp/zela-response.txt

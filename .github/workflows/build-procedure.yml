@@ -1,0 +1,130 @@
+name: Build Procedure
+
+# Reusable workflow: builds a single Zela procedure to a WebAssembly Component
+# (`wasm32-wasip2`) and uploads the artifact for downstream jobs.
+#
+# Outputs the artifact under the name `${procedure}-wasm`.
+#
+# Security note: every input that flows into a `run:` block is forwarded via
+# `env:` rather than expanded inline, to neutralise command-injection if a
+# caller forwards untrusted data into one of these inputs.
+
+on:
+  workflow_call:
+    inputs:
+      procedure:
+        description: "Procedure name (used for the artifact name and as the default cargo package)."
+        required: true
+        type: string
+      cargo-package:
+        description: "Cargo package to build. Defaults to the procedure name."
+        required: false
+        type: string
+        default: ""
+      rust-toolchain:
+        description: "Rustup toolchain to install (e.g. 'stable', '1.85', 'nightly')."
+        required: false
+        type: string
+        default: "stable"
+      wasi-sdk-version:
+        description: "wasi-sdk major version to install (e.g. '30')."
+        required: false
+        type: string
+        default: "30"
+      runs-on:
+        description: "GitHub-hosted runner image."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      cargo-build-args:
+        description: "Extra args appended to `cargo build`. Treated as a trusted shell fragment — only set this from caller-controlled values."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      artifact-name:
+        description: "Name of the uploaded artifact containing the .wasm."
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.procedure }}
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      artifact-name: ${{ steps.config.outputs.artifact-name }}
+    steps:
+      - name: Resolve config
+        id: config
+        env:
+          INPUT_PROCEDURE: ${{ inputs.procedure }}
+          INPUT_CARGO_PACKAGE: ${{ inputs.cargo-package }}
+        run: |
+          pkg="${INPUT_CARGO_PACKAGE:-$INPUT_PROCEDURE}"
+          echo "cargo-package=$pkg" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${INPUT_PROCEDURE}-wasm" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+
+      - name: Cache wasi-sdk
+        id: wasi-sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/wasi-sdk.deb
+          key: wasi-sdk-${{ inputs.wasi-sdk-version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Download wasi-sdk
+        if: steps.wasi-sdk-cache.outputs.cache-hit != 'true'
+        env:
+          WASI_SDK_VERSION: ${{ inputs.wasi-sdk-version }}
+        run: |
+          # The wasi-sdk asset names follow `wasi-sdk-<ver>.0-<arch>-<os>.deb`.
+          # GitHub-hosted ubuntu-latest runners are x86_64; if you switch to
+          # arm64 self-hosted runners, override `runs-on` and update this URL.
+          curl -L --fail --progress-bar \
+            -o /tmp/wasi-sdk.deb \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.deb"
+
+      - name: Install wasi-sdk
+        run: sudo dpkg -i /tmp/wasi-sdk.deb
+
+      - name: Install Rust toolchain ${{ inputs.rust-toolchain }} + wasm32-wasip2 target
+        env:
+          RUST_TOOLCHAIN: ${{ inputs.rust-toolchain }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add wasm32-wasip2
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Per-procedure key prevents cache pollution when multiple procedures
+          # share the same workspace but pull different feature sets.
+          shared-key: "zela-procedure-${{ inputs.procedure }}"
+          cache-on-failure: true
+
+      - name: Build ${{ steps.config.outputs.cargo-package }}
+        env:
+          # `cargo build` looks up `CC_wasm32_wasip2` and `WASI_SYSROOT` to
+          # compile any FFI dependencies (e.g. ring/openssl) for the target.
+          CC_wasm32_wasip2: /opt/wasi-sdk/bin/clang
+          WASI_SYSROOT: /opt/wasi-sdk/share/wasi-sysroot
+          CARGO_PACKAGE: ${{ steps.config.outputs.cargo-package }}
+          # `cargo-build-args` is documented as a trusted shell fragment —
+          # callers set fixed flags like `--features foo`. We still bind via
+          # env so it's at least visible in the step config, not interpolated.
+          CARGO_BUILD_ARGS: ${{ inputs.cargo-build-args }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo build --release --locked \
+            --target wasm32-wasip2 \
+            --package "$CARGO_PACKAGE" \
+            $CARGO_BUILD_ARGS
+
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.config.outputs.artifact-name }}
+          path: target/wasm32-wasip2/release/${{ steps.config.outputs.cargo-package }}.wasm
+          if-no-files-found: error
+          retention-days: 90
