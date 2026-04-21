@@ -63,11 +63,11 @@ jobs:
           echo "cargo-package=$pkg" >> "$GITHUB_OUTPUT"
           echo "artifact-name=${INPUT_PROCEDURE}-wasm" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache wasi-sdk
         id: wasi-sdk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/wasi-sdk.deb
           key: wasi-sdk-${{ inputs.wasi-sdk-version }}-${{ runner.os }}-${{ runner.arch }}
@@ -122,7 +122,7 @@ jobs:
             $CARGO_BUILD_ARGS
 
       - name: Upload wasm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.config.outputs.artifact-name }}
           path: target/wasm32-wasip2/release/${{ steps.config.outputs.cargo-package }}.wasm
