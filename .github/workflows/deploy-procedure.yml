@@ -134,6 +134,12 @@ jobs:
             "$url")
 
           echo "HTTP $http_code"
+          if [ "$http_code" = "404" ]; then
+            echo "::error::Procedure '${INPUT_PROCEDURE}' is not registered on the Zela dashboard for project ${INPUT_PROJECT}. Create it first (Dashboard → Procedures → New procedure), then re-run this workflow."
+            echo "Response body:"
+            cat /tmp/zela-response.txt
+            exit 1
+          fi
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::Deploy failed with HTTP $http_code."
             echo "Response body:"
