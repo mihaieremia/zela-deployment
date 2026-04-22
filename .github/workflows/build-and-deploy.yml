@@ -42,16 +42,6 @@ on:
         required: false
         type: string
         default: ""
-      core-url:
-        description: "Zela builder API base URL."
-        required: false
-        type: string
-        default: "https://core.zela.io"
-      auth-url:
-        description: "Zela OIDC token endpoint."
-        required: false
-        type: string
-        default: "https://auth.zela.io/realms/zela/protocol/openid-connect/token"
     secrets:
       key-id:
         description: "Zela project key ID."
@@ -82,8 +72,6 @@ jobs:
       procedure: ${{ inputs.procedure }}
       project: ${{ inputs.project }}
       wasm-artifact: ${{ needs.build.outputs.artifact-name }}
-      core-url: ${{ inputs.core-url }}
-      auth-url: ${{ inputs.auth-url }}
       runs-on: ${{ inputs.runs-on }}
     secrets:
       key-id: ${{ secrets.key-id }}

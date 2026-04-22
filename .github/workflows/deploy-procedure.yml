@@ -28,16 +28,6 @@ on:
         required: false
         type: string
         default: ""
-      core-url:
-        description: "Zela builder API base URL."
-        required: false
-        type: string
-        default: "https://core.zela.io"
-      auth-url:
-        description: "Zela OIDC token endpoint."
-        required: false
-        type: string
-        default: "https://auth.zela.io/realms/zela/protocol/openid-connect/token"
       runs-on:
         description: "GitHub-hosted runner image."
         required: false
@@ -97,17 +87,28 @@ jobs:
         env:
           ZELA_KEY_ID: ${{ secrets.key-id }}
           ZELA_KEY_SECRET: ${{ secrets.key-secret }}
-          AUTH_URL: ${{ inputs.auth-url }}
         run: |
-          response=$(curl -sS --user "$ZELA_KEY_ID:$ZELA_KEY_SECRET" \
+          # Endpoint is hardcoded — accepting it as a caller input would let a
+          # caller forwarding untrusted data exfiltrate the project key
+          # (Basic-auth body) to an arbitrary host. If you need a non-prod
+          # tenant, fork this workflow and change the URL here.
+          set +e
+          response=$(curl -sS --fail-with-body --user "$ZELA_KEY_ID:$ZELA_KEY_SECRET" \
             --data-urlencode 'grant_type=client_credentials' \
             --data-urlencode 'scope=zela-builder:read zela-builder:write' \
-            "$AUTH_URL")
+            'https://auth.zela.io/realms/zela/protocol/openid-connect/token')
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "::error::OAuth token request failed at the transport/HTTP layer (curl exit $curl_exit)."
+            echo "Response body (sensitive fields stripped):"
+            echo "$response" | jq 'del(.access_token, .refresh_token)' 2>/dev/null || echo "$response"
+            exit 1
+          fi
           token=$(echo "$response" | jq -r '.access_token // empty')
           if [ -z "$token" ]; then
-            echo "::error::OAuth token request failed."
-            # Echo response with sensitive fields stripped just in case.
-            echo "$response" | jq 'del(.access_token, .refresh_token)' || echo "$response"
+            echo "::error::OAuth response was 2xx but did not contain access_token."
+            echo "$response" | jq 'del(.access_token, .refresh_token)' 2>/dev/null || echo "$response"
             exit 1
           fi
           # Mask the token so accidental echoes are scrubbed from logs.
@@ -117,23 +118,41 @@ jobs:
       - name: Upload wasm to Zela
         env:
           TOKEN: ${{ steps.token.outputs.token }}
-          CORE_URL: ${{ inputs.core-url }}
           INPUT_PROCEDURE: ${{ inputs.procedure }}
           INPUT_PROJECT: ${{ inputs.project }}
           WASM_FILE_NAME: ${{ steps.config.outputs.wasm-file-name }}
         run: |
+          # Endpoint is hardcoded — see the OAuth step for the rationale.
+          # `procedure`, `project`, and `wasm-file-name` are URL-encoded via
+          # jq so caller-controlled `?`, `&`, `/`, or whitespace can't change
+          # request semantics or break out of the query string.
+          encode() { jq -nrR --arg s "$1" '$s|@uri'; }
           path="./artifact/${WASM_FILE_NAME}"
-          url="${CORE_URL}/procedures/${INPUT_PROCEDURE}/wasm?project=${INPUT_PROJECT}&file_name=${WASM_FILE_NAME}"
+          procedure_enc=$(encode "$INPUT_PROCEDURE")
+          project_enc=$(encode "$INPUT_PROJECT")
+          file_name_enc=$(encode "$WASM_FILE_NAME")
+          url="https://core.zela.io/procedures/${procedure_enc}/wasm?project=${project_enc}&file_name=${file_name_enc}"
 
-          # Capture body + status separately so we can surface the API's error
-          # message on failure (the original workflow's `-f` swallowed bodies).
+          # Capture body, exit code, and HTTP status separately so we can
+          # surface transport failures (DNS/TLS/connect) AND HTTP errors with
+          # the API's error message on either path. `set +e` is needed because
+          # GitHub Actions defaults shell to `bash -e {0}` and curl exits non-
+          # zero on any transport failure, which would otherwise abort the step
+          # before our diagnostics block runs.
+          set +e
           http_code=$(curl --progress-bar -o /tmp/zela-response.txt -w '%{http_code}' \
             -H "authorization: Bearer $TOKEN" \
             -H 'content-type: application/wasm' \
             --data-binary "@$path" \
             "$url")
+          curl_exit=$?
+          set -e
 
-          echo "HTTP $http_code"
+          echo "HTTP $http_code (curl exit $curl_exit)"
+          if [ "$curl_exit" -ne 0 ] && [ "$http_code" = "000" ]; then
+            echo "::error::Upload failed at the transport/HTTP layer (curl exit $curl_exit). Network, DNS, or TLS error reaching core.zela.io."
+            exit 1
+          fi
           if [ "$http_code" = "404" ]; then
             echo "::error::Procedure '${INPUT_PROCEDURE}' is not registered on the Zela dashboard for project ${INPUT_PROJECT}. Create it first (Dashboard → Procedures → New procedure), then re-run this workflow."
             echo "Response body:"
