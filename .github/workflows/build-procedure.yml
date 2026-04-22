@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: "30"
+      wasm-tools-version:
+        description: "wasm-tools version to install (used for stripping non-essential custom sections from the built wasm)."
+        required: false
+        type: string
+        default: "1.247.0"
       runs-on:
         description: "GitHub-hosted runner image."
         required: false
@@ -120,6 +125,37 @@ jobs:
             --target wasm32-wasip2 \
             --package "$CARGO_PACKAGE" \
             $CARGO_BUILD_ARGS
+
+      # Cache wasm-tools binary by version so it isn't recompiled every run.
+      - name: Cache wasm-tools
+        id: wasm-tools-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/wasm-tools
+          key: wasm-tools-${{ inputs.wasm-tools-version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install wasm-tools
+        if: steps.wasm-tools-cache.outputs.cache-hit != 'true'
+        env:
+          WASM_TOOLS_VERSION: ${{ inputs.wasm-tools-version }}
+        run: cargo install --locked --version "$WASM_TOOLS_VERSION" wasm-tools
+
+      - name: Strip non-essential custom sections
+        env:
+          WASM_PATH: target/wasm32-wasip2/release/${{ steps.config.outputs.cargo-package }}.wasm
+        run: |
+          # `wasm-tools strip` is component-aware; binaryen's `wasm-opt` is not
+          # (see WebAssembly/binaryen issue 6728). Removes producers, debug
+          # names, target-features, and other non-essential custom sections
+          # without touching executable code or interface contracts. Typical
+          # gain: 1-3% on the final component artifact.
+          before=$(stat -c%s "$WASM_PATH")
+          wasm-tools strip "$WASM_PATH" -o "$WASM_PATH.stripped"
+          mv "$WASM_PATH.stripped" "$WASM_PATH"
+          after=$(stat -c%s "$WASM_PATH")
+          saved=$((before - after))
+          pct=$(awk "BEGIN{printf \"%.2f\", $saved * 100 / $before}")
+          echo "Stripped: $before B -> $after B (saved $saved B, -$pct%)"
 
       - name: Upload wasm artifact
         uses: actions/upload-artifact@v7
