@@ -32,10 +32,20 @@ on:
         type: string
         default: "30"
       wasm-tools-version:
-        description: "wasm-tools version to install (used for stripping non-essential custom sections from the built wasm)."
+        description: "wasm-tools version to install (used for component-aware stripping and re-bundling)."
         required: false
         type: string
         default: "1.247.0"
+      binaryen-version:
+        description: "binaryen (wasm-opt) release tag to install. Component-model wasm cannot be opt'd directly; we round-trip via wasm-tools."
+        required: false
+        type: string
+        default: "version_129"
+      wasmtime-version:
+        description: "wasmtime release tag the WASI Preview 1 reactor adapter is downloaded from."
+        required: false
+        type: string
+        default: "v37.0.0"
       runs-on:
         description: "GitHub-hosted runner image."
         required: false
@@ -140,22 +150,92 @@ jobs:
           WASM_TOOLS_VERSION: ${{ inputs.wasm-tools-version }}
         run: cargo install --locked --version "$WASM_TOOLS_VERSION" wasm-tools
 
-      - name: Strip non-essential custom sections
+      - name: Cache binaryen
+        id: binaryen-cache
+        uses: actions/cache@v5
+        with:
+          path: /opt/binaryen
+          key: binaryen-${{ inputs.binaryen-version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install binaryen (wasm-opt)
+        if: steps.binaryen-cache.outputs.cache-hit != 'true'
+        env:
+          BINARYEN_VERSION: ${{ inputs.binaryen-version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo mkdir -p /opt/binaryen
+          gh release download --repo WebAssembly/binaryen "$BINARYEN_VERSION" \
+            --pattern 'binaryen-*-x86_64-linux.tar.gz' --output /tmp/binaryen.tar.gz
+          sudo tar -xzf /tmp/binaryen.tar.gz -C /opt/binaryen --strip-components=1
+
+      - name: Cache WASI reactor adapter
+        id: wasi-adapter-cache
+        uses: actions/cache@v5
+        with:
+          path: /tmp/wasi_snapshot_preview1.reactor.wasm
+          key: wasi-adapter-${{ inputs.wasmtime-version }}-${{ runner.os }}
+
+      - name: Download WASI Preview 1 reactor adapter
+        if: steps.wasi-adapter-cache.outputs.cache-hit != 'true'
+        env:
+          WASMTIME_VERSION: ${{ inputs.wasmtime-version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo bytecodealliance/wasmtime "$WASMTIME_VERSION" \
+            --pattern 'wasi_snapshot_preview1.reactor.wasm' --output /tmp/wasi_snapshot_preview1.reactor.wasm
+
+      - name: Optimise wasm component
         env:
           WASM_PATH: target/wasm32-wasip2/release/${{ steps.config.outputs.cargo-package }}.wasm
+          PATH_BINARYEN: /opt/binaryen/bin
+          ADAPTER: /tmp/wasi_snapshot_preview1.reactor.wasm
         run: |
-          # `wasm-tools strip` is component-aware; binaryen's `wasm-opt` is not
-          # (see WebAssembly/binaryen issue 6728). Removes producers, debug
-          # names, target-features, and other non-essential custom sections
-          # without touching executable code or interface contracts. Typical
-          # gain: 1-3% on the final component artifact.
+          # Component Model wasm cannot be passed to `wasm-opt` directly
+          # (binaryen issue 6728). We round-trip:
+          #   1. wasm-tools strip            — drop producer/name/target-features sections
+          #   2. wasm-tools component wit    — extract the resolved WIT (incl. WASI imports)
+          #   3. wasm-tools component unbundle — split out the inner core module
+          #   4. wasm-opt -Oz                — optimise the core module (binaryen DOES handle core modules)
+          #   5. wasm-tools component embed  — re-attach the extracted WIT
+          #   6. wasm-tools component new    — rewrap as a component using the WASI reactor adapter
+          # If steps 2-6 fail (e.g. wit-parser bug on a particular WASI subset
+          # like wasi:clocks under wit-parser 0.247), we keep the stripped
+          # version so we still get the strip-only saving (~1-3%).
+
+          set +e
           before=$(stat -c%s "$WASM_PATH")
-          wasm-tools strip "$WASM_PATH" -o "$WASM_PATH.stripped"
-          mv "$WASM_PATH.stripped" "$WASM_PATH"
+          work="$(mktemp -d)"
+          export PATH="$PATH_BINARYEN:$PATH"
+
+          wasm-tools strip "$WASM_PATH" -o "$work/stripped.wasm"
+          # Default outcome: keep the stripped version
+          cp "$work/stripped.wasm" "$work/result.wasm"
+
+          # Try the full round-trip
+          if wasm-tools component wit "$work/stripped.wasm" > "$work/full.wit" 2>/dev/null \
+             && wasm-tools component unbundle --module-dir "$work" --threshold 0 "$work/stripped.wasm" -o "$work/wrap.wasm" 2>/dev/null \
+             && [ -f "$work/unbundled-module0.wasm" ] \
+             && wasm-opt -Oz --enable-bulk-memory --enable-sign-ext --enable-multivalue --enable-mutable-globals --enable-reference-types --enable-nontrapping-float-to-int --debuginfo "$work/unbundled-module0.wasm" -o "$work/core.opt" 2>/dev/null \
+             && wasm-tools component embed "$work/full.wit" --world root "$work/core.opt" -o "$work/core.embedded" 2>/dev/null \
+             && wasm-tools component new --adapt "wasi_snapshot_preview1=$ADAPTER" "$work/core.embedded" -o "$work/result.wasm" 2>/dev/null ; then
+            mode="full round-trip"
+          else
+            cp "$work/stripped.wasm" "$work/result.wasm"
+            mode="strip-only (round-trip skipped)"
+          fi
+
+          # Verify the result still parses as a valid component
+          if ! wasm-tools validate "$work/result.wasm" 2>/dev/null ; then
+            echo "::warning::Optimised wasm failed validation; reverting to original."
+            cp "$WASM_PATH" "$work/result.wasm"
+            mode="reverted (validation failed)"
+          fi
+
+          mv "$work/result.wasm" "$WASM_PATH"
           after=$(stat -c%s "$WASM_PATH")
           saved=$((before - after))
           pct=$(awk "BEGIN{printf \"%.2f\", $saved * 100 / $before}")
-          echo "Stripped: $before B -> $after B (saved $saved B, -$pct%)"
+          echo "Optimised ($mode): $before B -> $after B (saved $saved B, -$pct%)"
 
       - name: Upload wasm artifact
         uses: actions/upload-artifact@v7
