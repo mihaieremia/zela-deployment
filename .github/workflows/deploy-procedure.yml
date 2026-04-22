@@ -159,6 +159,16 @@ jobs:
             cat /tmp/zela-response.txt
             exit 1
           fi
+          # HTTP 422 with `entity already exists` means the bit-for-bit identical
+          # wasm is already deployed at this revision. Treat as a successful
+          # no-op (exit 0) so re-triggering a workflow on a no-source-change
+          # commit doesn't fail. Other 422s (real bad requests) still fail loud.
+          if [ "$http_code" = "422" ] && grep -q "entity already exists" /tmp/zela-response.txt 2>/dev/null; then
+            echo "::warning::Procedure '${INPUT_PROCEDURE}' was already deployed at this revision (no-op)."
+            echo "Response body:"
+            cat /tmp/zela-response.txt
+            exit 0
+          fi
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "::error::Deploy failed with HTTP $http_code."
             echo "Response body:"
