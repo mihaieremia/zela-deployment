@@ -211,8 +211,15 @@ jobs:
           # Default outcome: keep the stripped version
           cp "$work/stripped.wasm" "$work/result.wasm"
 
-          # Try the full round-trip
-          if wasm-tools component wit "$work/stripped.wasm" > "$work/full.wit" 2>/dev/null \
+          # Try the full round-trip.
+          # `wasm-tools component wit` extracts the WIT at the version the OUTER
+          # component declares (currently wasi:*@0.2.9 from rustc's wasm32-wasip2
+          # toolchain). The INNER core module's wasi-libc imports target the
+          # older wasi:*@0.2.0 ABI. wit-parser panics when the embed step tries
+          # to merge those mismatched versions. Patching the version string in
+          # the WIT pre-embed avoids the bug — the type semantics are identical
+          # across 0.2.x patches, only the package version label differs.
+          if wasm-tools component wit "$work/stripped.wasm" 2>/dev/null | sed 's/@0\.2\.9/@0.2.0/g' > "$work/full.wit" \
              && wasm-tools component unbundle --module-dir "$work" --threshold 0 "$work/stripped.wasm" -o "$work/wrap.wasm" 2>/dev/null \
              && [ -f "$work/unbundled-module0.wasm" ] \
              && wasm-opt -Oz --enable-bulk-memory --enable-sign-ext --enable-multivalue --enable-mutable-globals --enable-reference-types --enable-nontrapping-float-to-int --debuginfo "$work/unbundled-module0.wasm" -o "$work/core.opt" 2>/dev/null \
